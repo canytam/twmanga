@@ -1,0 +1,6 @@
+img2pdf
+tqdm
+beautifulsoup4
+pillow
+requests
+aiohttp
