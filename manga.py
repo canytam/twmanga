@@ -215,14 +215,15 @@ def validate_image_dimensions(filepath):
         with Image.open(filepath) as img:
             # Get DPI, default to 96 if missing/invalid (matches img2pdf behavior)
             dpi_x, dpi_y = img.info.get('dpi', (96.0, 96.0))
-            dpi_x = dpi_x if dpi_x > 0 else 96.0
-            dpi_y = dpi_y if dpi_y > 0 else 96.0
+            # Convert to floats to handle cases where DPI might be a Fraction
+            dpi_x = float(dpi_x) if float(dpi_x) > 0 else 96.0
+            dpi_y = float(dpi_y) if float(dpi_y) > 0 else 96.0
 
             # Calculate dimensions in PDF points
             width_pt = (img.width / dpi_x) * 72
             height_pt = (img.height / dpi_y) * 72
             logging.debug(
-                f"Image DPI: ({dpi_x}, {dpi_y}), "
+                f"Image DPI: ({dpi_x:.1f}, {dpi_y:.1f}), "
                 f"Dimensions: {img.width}x{img.height}px, "
                 f"PDF Points: {width_pt:.1f}x{height_pt:.1f}"
             )
@@ -237,7 +238,7 @@ def validate_image_dimensions(filepath):
     except Exception as e:
         logging.error(f"Image validation failed for {filepath}: {e}")
         return False
-        
+            
         
 async def async_download_image(session, url, chapter_dir, idx):
     """Download and validate images asynchronously."""
