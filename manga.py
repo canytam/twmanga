@@ -37,7 +37,7 @@ PDF_PROCESSOR_WORKERS = 4
 
 async def get_content_info(session, book_id):
     """Fetch and parse comic content page information asynchronously."""
-    url = f"https://www.baozimh.com/comic/{book_id}"
+    url = f"https://www.twmanga.com/comic/{book_id}"
     logging.info(f"Fetching content page: {url}")
     
     try:
