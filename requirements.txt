@@ -1,6 +1,11 @@
+brotli
 img2pdf
 tqdm
 beautifulsoup4
 pillow
 requests
 aiohttp
+aiofiles
+reportlab
+pypdf2
+psutil

@@ -155,18 +155,18 @@ async def process_pdf_batch(session, group, batch_number, folder_name, image_sem
         all_images = []
         with tqdm_asyncio(total=total_images, desc=batch_desc[:20]) as pbar:
             tasks = []
-            for chap_idx, chap_data in enumerate(chapters_data):
-                for page_idx, url in enumerate(chap_data['urls']):
-                    img_name = f"{chap_idx:04d}_{page_idx:04d}.jpg"
-                    img_path = os.path.join(tmpdir, img_name)
+            for chap_data in chapters_data:
+                chapter_dir = os.path.join(tmpdir, chap_data['desc'])
+                os.makedirs(chapter_dir, exist_ok=True)
+                for idx, url in enumerate(chap_data['urls']):
+                    img_path = os.path.join(chapter_dir, f"page_{idx:04}.jpg")
                     tasks.append(
                         download_image(session, url, img_path, image_semaphore, pbar, chap_data['desc'])
                     )
             
             results = await asyncio.gather(*tasks)
             successful_images = [res for res in results if res is not None]
-            # Sort by filename to maintain chapter and page order
-            successful_images.sort()
+            successful_images.sort(key=lambda x: (os.path.basename(os.path.dirname(x)), x))
             all_images = successful_images
 
         if not all_images:
@@ -185,7 +185,7 @@ async def process_pdf_batch(session, group, batch_number, folder_name, image_sem
             if os.path.exists(pdf_path):
                 os.remove(pdf_path)
             return None
-        
+
 async def main_async(book_id, num_pdfs=None):
     base_url = f"https://www.twmanga.com/comic/{book_id}"
     

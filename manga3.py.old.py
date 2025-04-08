@@ -5,6 +5,8 @@ import logging
 import os
 import shutil
 import sys
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 import tempfile  # Required for temp directory info
 from functools import partial
 from urllib.parse import urlparse, parse_qs, urljoin
@@ -13,7 +15,7 @@ import aiohttp
 import img2pdf
 from bs4 import BeautifulSoup
 from PIL import Image
-from concurrent.futures import ProcessPoolExecutor
+from PyPDF2 import PdfMerger
 
 # Configure logging
 logging.basicConfig(
@@ -28,11 +30,10 @@ HEADERS = {
                   'Chrome/91.0.4472.124 Safari/537.36'
 }
 
-CONCURRENCY_LIMIT = 10  # Adjust based on server tolerance
+CONCURRENCY_LIMIT = 5  # Adjust based on server tolerance
 semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-IMAGE_CONCURRENCY_LIMIT = 20
+IMAGE_CONCURRENCY_LIMIT = 10
 image_semaphore = asyncio.Semaphore(IMAGE_CONCURRENCY_LIMIT)
-PDF_PROCESSOR_WORKERS = 4
 
 
 async def get_content_info(session, book_id):
@@ -364,46 +365,80 @@ async def create_pdf_sync(image_paths, output_path):
         os.remove(output_path)
     return False
 
-async def download_and_create_pdf(session, output_dir, chapter_slot, chapter_title, manga_title, image_urls, keep_images):
-    """Robust PDF creation with enhanced diagnostics."""
-    # Use simple ASCII filename for testing
-    sanitized_title = sanitize_filename(manga_title)
-    sanitized_chapter_title = sanitize_filename(chapter_title)
-    pdf_filename = f"Chapter_{chapter_slot}_{sanitized_title}_{sanitized_chapter_title}.pdf"
-    pdf_path = os.path.abspath(os.path.join(output_dir, pdf_filename))
+async def download_and_create_pdf(session, output_dir, chapter_slot, chapter_title, image_urls, keep_images, next_chapter=None):
+    """Create PDF with next chapter navigation using proper PDF merging"""
+    pdf_filename = f"chapter_{chapter_slot}.pdf"
+    pdf_path = os.path.join(output_dir, pdf_filename)
+    temp_dir = os.path.join(output_dir, f"temp_{chapter_slot}")
     
-    # Clean existing test file
-    if os.path.exists(pdf_path):
-        os.remove(pdf_path)
+    if os.path.exists(pdf_path) and not keep_images:
+        return
 
-    temp_dir = os.path.abspath(os.path.join(output_dir, f"temp_{chapter_slot}"))
     os.makedirs(temp_dir, exist_ok=True)
+    merger = PdfMerger()
 
     try:
-        # Download images with integrity check
+        # 1. Create main PDF from images
+        image_pdf = os.path.join(temp_dir, "content.pdf")
         valid_files = []
-        for idx, url in enumerate(image_urls, 1):
-            file_path = await async_download_image(session, url, temp_dir, idx)
-            if file_path and await verify_image_integrity(file_path):
-                valid_files.append(file_path)
         
-        if not valid_files:
-            logging.error("No valid images available for PDF creation")
+        # Download and validate images
+        download_tasks = [async_download_image(session, url, temp_dir, idx+1)
+                        for idx, url in enumerate(image_urls)]
+        image_paths = await asyncio.gather(*download_tasks)
+        valid_files = [p for p in image_paths if p is not None]
+
+        if valid_files:
+            # Create PDF from images
+            with open(image_pdf, "wb") as f:
+                f.write(img2pdf.convert(valid_files))
+            merger.append(image_pdf)
+        else:
+            logging.warning(f"No valid images for chapter {chapter_slot}")
             return
 
-        # Full PDF creation
-        #final_pdf_path = os.path.join(output_dir, f"chapter_{chapter_slot}.pdf")
-        success = await create_pdf_sync(valid_files, pdf_path)
-        
-        if success:
-            logging.info(f"Successfully created PDF: {pdf_path}")
-            logging.info(f"PDF contains {len(valid_files)} pages")
-        else:
-            logging.error("PDF creation failed after image verification")
+        # 2. Add navigation page if next chapter exists
+        if next_chapter:
+            try:
+                # Sanitize filename and create proper URI
+                next_pdf = f"chapter_{next_chapter['slot']}.pdf"
+                safe_uri = urljoin('file://', os.path.abspath(
+                    os.path.join(output_dir, next_pdf)
+                ).replace(' ', '%20'))
 
-    except Exception as e:
-        logging.error(f"Critical error in PDF creation: {str(e)}")
+                pdf_path = os.path.join(temp_dir, "nav_next.pdf")
+                c = canvas.Canvas(pdf_path, pagesize=letter)
+                width, height = letter
+        
+                # Create visible button
+                c.setFillColorRGB(0.13, 0.59, 0.95)  # Blue
+                c.roundRect(50, 50, width-100, 50, 10, fill=1)
+        
+                # Add text
+                c.setFillColorRGB(1,1,1)  # White
+                c.setFont("Helvetica-Bold", 14)
+                text = f"Next Chapter: {next_chapter['title']}"
+                c.drawCentredString(width/2, 70, text)
+        
+                # Add clickable area with encoded URI
+                c.linkURL(
+                    safe_uri,
+                    (50, 50, width-50, 100),
+                    relative=0  # Use absolute path for macOS compatibility
+                )
+                c.save()
+        
+                valid_files.append(pdf_path)
+                logging.debug("Added macOS-compatible navigation page")
+            except Exception as e:
+                logging.error(f"Navigation page error: {e}")
+
+        # 3. Save merged PDF
+        with open(pdf_path, "wb") as f:
+            merger.write(f)
+
     finally:
+        merger.close()
         if not keep_images:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -476,9 +511,7 @@ def generate_html_index(manga_title, chapters, output_dir):
 """
 
     for chapter in chapters_sorted:
-        sanitized_title = sanitize_filename(manga_title)
-        sanitized_chapter_title = sanitize_filename(chapter['title'])
-        pdf_filename = f"Chapter_{chapter['slot']}_{sanitized_title}_{sanitized_chapter_title}.pdf"
+        pdf_filename = f"chapter_{chapter['slot']}.pdf"
         html_content += f"""
         <li class="chapter-item">
             <a href="{pdf_filename}" class="chapter-link">
@@ -517,58 +550,68 @@ async def main():
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         try:
-            title, chapters = await get_content_info(session, args.book_id)
+            # Fetch comic information
+            title, raw_chapters = await get_content_info(session, args.book_id)
             output_dir = create_output_dir(title, args.book_id)
-            log_path = os.path.join(output_dir, 'images.txt')
-
+            
+            # Sort chapters numerically by slot
+            sorted_chapters = sorted(raw_chapters, key=lambda x: x['slot'])
+            
             # Phase 1: Collect image URLs for all chapters
-            tasks = [process_chapter(session, args.book_id, ch['slot'], ch['title']) for ch in chapters]
-            all_images = await asyncio.gather(*tasks)
+            logging.info("Collecting image URLs for chapters...")
+            chapter_tasks = [process_chapter(session, args.book_id, ch['slot'], ch['title'])
+                           for ch in sorted_chapters]
+            all_images = await asyncio.gather(*chapter_tasks)
 
-            # Write URLs to log file
-            with open(log_path, 'w', encoding='utf-8') as f:
-                for idx, (chapter, images) in enumerate(zip(chapters, all_images), 1):
-                    f.write(f"Chapter {idx}: {chapter['title']}\n")
-                    for img_url in images:
-                        f.write(f"{img_url}\n")
-                    f.write("\n")
+            # Create processing queue with next chapter info
+            chapter_queue = []
+            for i, (chapter, images) in enumerate(zip(sorted_chapters, all_images)):
+                next_ch = sorted_chapters[i+1] if i < len(sorted_chapters)-1 else None
+                chapter_queue.append({
+                    'current': chapter,
+                    'images': images,
+                    'next': next_ch
+                })
 
-            # Phase 2: Download images and create PDFs
+            # Phase 2: Process chapters with navigation links
             pdf_tasks = []
-            for chapter, image_urls in zip(chapters, all_images):
-                pdf_filename = f"chapter_{chapter['slot']}.pdf"
-                pdf_path = os.path.join(output_dir, pdf_filename)
+            for item in chapter_queue:
+                chapter = item['current']
+                pdf_path = os.path.join(output_dir, f"chapter_{chapter['slot']}.pdf")
                 
                 # Skip existing chapters unless forced
                 if os.path.exists(pdf_path) and not args.force:
                     logging.info(f"Skipping existing chapter: {chapter['title']}")
                     continue
-                
-                if not image_urls:
+                    
+                if not item['images']:
                     logging.warning(f"No images found for chapter {chapter['slot']}")
                     continue
 
-                pdf_task = download_and_create_pdf(
-                    session,
-                    output_dir,
-                    chapter['slot'],
-                    chapter['title'],
-                    title,  # Pass manga title
-                    image_urls,
-                    args.keep_images
+                task = download_and_create_pdf(
+                    session=session,
+                    output_dir=output_dir,
+                    chapter_slot=chapter['slot'],
+                    chapter_title=chapter['title'],
+                    image_urls=item['images'],
+                    keep_images=args.keep_images,
+                    next_chapter=item['next']
                 )
-                pdf_tasks.append(pdf_task)
+                pdf_tasks.append(task)
 
+            # Execute all PDF generation tasks
             await asyncio.gather(*pdf_tasks)
 
-            # Generate index with all chapters (including skipped ones)
-            generate_html_index(title, chapters, output_dir)
-            logging.info(f"Processing complete. Open index.html in {output_dir} to access chapters")
+            # Generate final index with all chapter info
+            generate_html_index(title, sorted_chapters, output_dir)
+            logging.info(f"Processing complete. Open {output_dir}/index.html for navigation")
 
         except Exception as e:
             logging.error(f"Fatal error: {e}")
-            raise
-            
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+            sys.exit(1)
 
 if __name__ == '__main__':
     asyncio.run(main())
