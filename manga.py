@@ -364,12 +364,12 @@ async def create_pdf_sync(image_paths, output_path):
         os.remove(output_path)
     return False
 
-async def download_and_create_pdf(session, output_dir, chapter_slot, chapter_title, manga_title, image_urls, keep_images):
+async def download_and_create_pdf(session, output_dir, manga_title, chapter_slot, chapter_title, image_urls, keep_images):
     """Robust PDF creation with enhanced diagnostics."""
     # Use simple ASCII filename for testing
-    sanitized_title = sanitize_filename(manga_title)
+    sanitized_manga_title = sanitize_filename(manga_title)
     sanitized_chapter_title = sanitize_filename(chapter_title)
-    pdf_filename = f"Chapter_{chapter_slot}_{sanitized_title}_{sanitized_chapter_title}.pdf"
+    pdf_filename = f"Chapter_{chapter_slot}_{sanitized_manga_title}_{sanitized_chapter_title}.pdf"
     pdf_path = os.path.abspath(os.path.join(output_dir, pdf_filename))
     
     # Clean existing test file
@@ -391,8 +391,6 @@ async def download_and_create_pdf(session, output_dir, chapter_slot, chapter_tit
             logging.error("No valid images available for PDF creation")
             return
 
-        # Full PDF creation
-        #final_pdf_path = os.path.join(output_dir, f"chapter_{chapter_slot}.pdf")
         success = await create_pdf_sync(valid_files, pdf_path)
         
         if success:
@@ -476,9 +474,9 @@ def generate_html_index(manga_title, chapters, output_dir):
 """
 
     for chapter in chapters_sorted:
-        sanitized_title = sanitize_filename(manga_title)
+        sanitized_manga_title = sanitize_filename(manga_title)
         sanitized_chapter_title = sanitize_filename(chapter['title'])
-        pdf_filename = f"Chapter_{chapter['slot']}_{sanitized_title}_{sanitized_chapter_title}.pdf"
+        pdf_filename = f"Chapter_{chapter['slot']}_{sanitized_manga_title}_{sanitized_chapter_title}.pdf"
         html_content += f"""
         <li class="chapter-item">
             <a href="{pdf_filename}" class="chapter-link">
@@ -551,9 +549,9 @@ async def main():
                 pdf_task = download_and_create_pdf(
                     session,
                     output_dir,
+                    title,
                     chapter['slot'],
                     chapter['title'],
-                    title,  # Pass manga title
                     image_urls,
                     args.keep_images
                 )
