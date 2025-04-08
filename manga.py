@@ -14,6 +14,8 @@ import img2pdf
 from bs4 import BeautifulSoup
 from PIL import Image
 from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
+import tqdm.asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -383,11 +385,23 @@ async def download_and_create_pdf(session, output_dir, manga_title, chapter_slot
     try:
         # Download images with integrity check
         valid_files = []
-        for idx, url in enumerate(image_urls, 1):
-            file_path = await async_download_image(session, url, temp_dir, idx)
-            if file_path and await verify_image_integrity(file_path):
-                valid_files.append(file_path)
-        
+        #for idx, url in enumerate(image_urls, 1):
+        #    file_path = await async_download_image(session, url, temp_dir, idx)
+        #    if file_path and await verify_image_integrity(file_path):
+        #        valid_files.append(file_path)
+        with tqdm.tqdm(
+            total=len(image_urls),
+            desc=f"🖼️ Ch-{chapter_slot}",
+            leave=False,
+            unit="img",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+        ) as pbar:
+            for idx, url in enumerate(image_urls, 1):
+                file_path = await async_download_image(session, url, temp_dir, idx)
+                if file_path and await verify_image_integrity(file_path):
+                    valid_files.append(file_path)
+                pbar.update(1)
+
         if not valid_files:
             logging.error("No valid images available for PDF creation")
             return
@@ -522,7 +536,11 @@ async def main():
 
             # Phase 1: Collect image URLs for all chapters
             tasks = [process_chapter(session, args.book_id, ch['slot'], ch['title']) for ch in chapters]
-            all_images = await asyncio.gather(*tasks)
+            all_images = await tqdm.asyncio.tqdm.gather(
+                *tasks, 
+                desc="📖 Fetching chapter URLs", 
+                colour="green"
+            )
 
             # Write URLs to log file
             with open(log_path, 'w', encoding='utf-8') as f:
@@ -558,8 +576,14 @@ async def main():
                 )
                 pdf_tasks.append(pdf_task)
 
-            await asyncio.gather(*pdf_tasks)
+            await tqdm.asyncio.tqdm.gather(
+                *pdf_tasks, 
+                desc="📚 Creating PDFs", 
+                colour="blue",
+                disable=args.debug  # Disable in debug mode to see logs clearly
+            )
 
+            logging.info(f"Processing complete. Results saved to {log_path}")
             # Generate index with all chapters (including skipped ones)
             generate_html_index(title, chapters, output_dir)
             logging.info(f"Processing complete. Open index.html in {output_dir} to access chapters")
