@@ -5,9 +5,7 @@ import logging
 import os
 import shutil
 import sys
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-import tempfile  # Required for temp directory info
+import tempfile
 from functools import partial
 from urllib.parse import urlparse, parse_qs, urljoin
 
@@ -15,9 +13,12 @@ import aiohttp
 import img2pdf
 from bs4 import BeautifulSoup
 from PIL import Image
-from PyPDF2 import PdfMerger
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
+import tqdm.asyncio
+import unicodedata
 
-# Configure logging
+# Initial console logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -30,15 +31,15 @@ HEADERS = {
                   'Chrome/91.0.4472.124 Safari/537.36'
 }
 
-CONCURRENCY_LIMIT = 5  # Adjust based on server tolerance
+CONCURRENCY_LIMIT = 10
 semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-IMAGE_CONCURRENCY_LIMIT = 10
+IMAGE_CONCURRENCY_LIMIT = 20
 image_semaphore = asyncio.Semaphore(IMAGE_CONCURRENCY_LIMIT)
-
+PDF_PROCESSOR_WORKERS = 4
 
 async def get_content_info(session, book_id):
     """Fetch and parse comic content page information asynchronously."""
-    url = f"https://www.baozimh.com/comic/{book_id}"
+    url = f"https://www.twmanga.com/comic/{book_id}"
     logging.info(f"Fetching content page: {url}")
     
     try:
@@ -74,14 +75,12 @@ async def get_content_info(session, book_id):
 
     return manga_title, chapters
 
-
 def create_output_dir(manga_title, book_id):
     """Create output directory with sanitized name."""
     sanitized = ''.join(c if c.isalnum() or c in (' ', '_') else '_' for c in manga_title)
     dir_name = f"{sanitized}_{book_id}"
     os.makedirs(dir_name, exist_ok=True)
     return dir_name
-
 
 def extract_url_slot(url):
     """Extract chapter slot from chapter URL."""
@@ -95,7 +94,6 @@ def extract_url_slot(url):
         logging.error(f"Error parsing URL slot: {e}")
         return None
 
-
 def extract_part_number(url):
     """Extract part number from URL."""
     try:
@@ -107,7 +105,6 @@ def extract_part_number(url):
     except (IndexError, ValueError, AttributeError) as e:
         logging.error(f"Error extracting part number from {url}: {e}")
         return None
-
 
 async def get_next_part(session, current_url):
     """Asynchronously find next part URL."""
@@ -145,7 +142,6 @@ async def get_next_part(session, current_url):
             return candidate['url']
 
     return None
-
 
 async def process_chapter(session, book_id, chapter_slot, chapter_title):
     """Process a chapter to extract image URLs asynchronously."""
@@ -209,21 +205,18 @@ async def process_chapter(session, book_id, chapter_slot, chapter_title):
         logging.info(f"Completed chapter {chapter_slot} with {len(image_urls)} unique images")
         return image_urls
 
-
 def validate_image_dimensions(filepath):
     """Check if image dimensions in PDF points are within valid range."""
     try:
         with Image.open(filepath) as img:
-            # Get DPI, default to 96 if missing/invalid (matches img2pdf behavior)
             dpi_x, dpi_y = img.info.get('dpi', (96.0, 96.0))
-            dpi_x = dpi_x if dpi_x > 0 else 96.0
-            dpi_y = dpi_y if dpi_y > 0 else 96.0
+            dpi_x = float(dpi_x) if float(dpi_x) > 0 else 96.0
+            dpi_y = float(dpi_y) if float(dpi_y) > 0 else 96.0
 
-            # Calculate dimensions in PDF points
             width_pt = (img.width / dpi_x) * 72
             height_pt = (img.height / dpi_y) * 72
             logging.debug(
-                f"Image DPI: ({dpi_x}, {dpi_y}), "
+                f"Image DPI: ({dpi_x:.1f}, {dpi_y:.1f}), "
                 f"Dimensions: {img.width}x{img.height}px, "
                 f"PDF Points: {width_pt:.1f}x{height_pt:.1f}"
             )
@@ -238,8 +231,7 @@ def validate_image_dimensions(filepath):
     except Exception as e:
         logging.error(f"Image validation failed for {filepath}: {e}")
         return False
-        
-        
+            
 async def async_download_image(session, url, chapter_dir, idx):
     """Download and validate images asynchronously."""
     async with image_semaphore:
@@ -248,7 +240,6 @@ async def async_download_image(session, url, chapter_dir, idx):
                 response.raise_for_status()
                 content = await response.read()
                 
-                # Detect extension from Content-Type
                 content_type = response.headers.get('Content-Type', '').lower()
                 if 'image/jpeg' in content_type:
                     ext = '.jpg'
@@ -257,21 +248,19 @@ async def async_download_image(session, url, chapter_dir, idx):
                 elif 'image/gif' in content_type:
                     ext = '.gif'
                 else:
-                    ext = '.bin'  # Fallback extension
+                    ext = '.bin'
 
                 filename = f"image_{idx:03d}{ext}"
                 filepath = os.path.join(chapter_dir, filename)
                 
-                # Save image
                 with open(filepath, 'wb') as f:
                     f.write(content)
                 
-                # Validate dimensions in executor
                 loop = asyncio.get_event_loop()
                 is_valid = await loop.run_in_executor(
                     None, partial(validate_image_dimensions, filepath))
                 
-                if not is_valid:  # Now properly indented
+                if not is_valid:
                     os.remove(filepath)
                     return None
                 
@@ -280,35 +269,10 @@ async def async_download_image(session, url, chapter_dir, idx):
             logging.error(f"Image download failed: {url} - {e}")
             return None
 
-
-async def create_pdf(image_paths, output_pdf):
-    """Create a PDF from a list of image paths."""
-    loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(
-            None,
-            partial(lambda paths, pdf: img2pdf.convert(*paths, output=pdf), image_paths, output_pdf)
-        )
-        logging.info(f"PDF created: {output_pdf}")
-    except Exception as e:
-        logging.error(f"Failed to create PDF {output_pdf}: {e}")
-        raise
-
-
-import sys
-import unicodedata
-
 def sanitize_filename(name):
     """Safely sanitize filenames with Unicode support."""
-    # Normalize Unicode characters
     name = unicodedata.normalize('NFKC', name)
-    # Replace problematic characters
     return "".join([c if c.isalnum() or c in ('_', '-') else '_' for c in name]).strip('_')
-
-import sys
-import asyncio
-import img2pdf
-from PIL import Image
 
 async def verify_image_integrity(image_path):
     """Ensure images are valid and readable."""
@@ -325,7 +289,6 @@ async def create_pdf_sync(image_paths, output_path):
     valid_images = []
     for img_path in image_paths:
         try:
-            # Re-validate each image right before conversion
             with Image.open(img_path) as img:
                 dpi_x, dpi_y = img.info.get('dpi', (96.0, 96.0))
                 dpi_x = dpi_x if dpi_x > 0 else 96.0
@@ -365,91 +328,51 @@ async def create_pdf_sync(image_paths, output_path):
         os.remove(output_path)
     return False
 
-async def download_and_create_pdf(session, output_dir, chapter_slot, chapter_title, image_urls, keep_images, next_chapter=None):
-    """Create PDF with next chapter navigation using proper PDF merging"""
-    pdf_filename = f"chapter_{chapter_slot}.pdf"
-    pdf_path = os.path.join(output_dir, pdf_filename)
-    temp_dir = os.path.join(output_dir, f"temp_{chapter_slot}")
+async def download_and_create_pdf(session, output_dir, manga_title, chapter_slot, chapter_title, image_urls, keep_images):
+    """Robust PDF creation with enhanced diagnostics."""
+    sanitized_manga_title = sanitize_filename(manga_title)
+    sanitized_chapter_title = sanitize_filename(chapter_title)
+    pdf_filename = f"Chapter_{chapter_slot}_{sanitized_manga_title}_{sanitized_chapter_title}.pdf"
+    pdf_path = os.path.abspath(os.path.join(output_dir, pdf_filename))
     
-    if os.path.exists(pdf_path) and not keep_images:
-        return
+    if os.path.exists(pdf_path):
+        os.remove(pdf_path)
 
+    temp_dir = os.path.abspath(os.path.join(output_dir, f"temp_{chapter_slot}"))
     os.makedirs(temp_dir, exist_ok=True)
-    merger = PdfMerger()
 
     try:
-        # 1. Create main PDF from images
-        image_pdf = os.path.join(temp_dir, "content.pdf")
         valid_files = []
-        
-        # Download and validate images
-        download_tasks = [async_download_image(session, url, temp_dir, idx+1)
-                        for idx, url in enumerate(image_urls)]
-        image_paths = await asyncio.gather(*download_tasks)
-        valid_files = [p for p in image_paths if p is not None]
+        with tqdm.tqdm(
+            total=len(image_urls),
+            desc=f"🖼️ Ch-{chapter_slot}",
+            leave=False,
+            unit="img",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+        ) as pbar:
+            for idx, url in enumerate(image_urls, 1):
+                file_path = await async_download_image(session, url, temp_dir, idx)
+                if file_path and await verify_image_integrity(file_path):
+                    valid_files.append(file_path)
+                pbar.update(1)
 
-        if valid_files:
-            # Create PDF from images
-            with open(image_pdf, "wb") as f:
-                f.write(img2pdf.convert(valid_files))
-            merger.append(image_pdf)
-        else:
-            logging.warning(f"No valid images for chapter {chapter_slot}")
+        if not valid_files:
+            logging.error("No valid images available for PDF creation")
             return
 
-        # 2. Add navigation page if next chapter exists
-        if next_chapter:
-            try:
-                # Sanitize filename and create proper URI
-                next_pdf = f"chapter_{next_chapter['slot']}.pdf"
-                safe_uri = urljoin('file://', os.path.abspath(
-                    os.path.join(output_dir, next_pdf)
-                ).replace(' ', '%20'))
+        success = await create_pdf_sync(valid_files, pdf_path)
+        
+        if success:
+            logging.info(f"Successfully created PDF: {pdf_path}")
+            logging.info(f"PDF contains {len(valid_files)} pages")
+        else:
+            logging.error("PDF creation failed after image verification")
 
-                pdf_path = os.path.join(temp_dir, "nav_next.pdf")
-                c = canvas.Canvas(pdf_path, pagesize=letter)
-                width, height = letter
-        
-                # Create visible button
-                c.setFillColorRGB(0.13, 0.59, 0.95)  # Blue
-                c.roundRect(50, 50, width-100, 50, 10, fill=1)
-        
-                # Add text
-                c.setFillColorRGB(1,1,1)  # White
-                c.setFont("Helvetica-Bold", 14)
-                text = f"Next Chapter: {next_chapter['title']}"
-                c.drawCentredString(width/2, 70, text)
-        
-                # Add clickable area with encoded URI
-                c.linkURL(
-                    safe_uri,
-                    (50, 50, width-50, 100),
-                    relative=0  # Use absolute path for macOS compatibility
-                )
-                c.save()
-        
-                valid_files.append(pdf_path)
-                logging.debug("Added macOS-compatible navigation page")
-            except Exception as e:
-                logging.error(f"Navigation page error: {e}")
-
-        # 3. Save merged PDF
-        with open(pdf_path, "wb") as f:
-            merger.write(f)
-
+    except Exception as e:
+        logging.error(f"Critical error in PDF creation: {str(e)}")
     finally:
-        merger.close()
         if not keep_images:
             shutil.rmtree(temp_dir, ignore_errors=True)
-
-# Verification steps for environment
-logging.info("--- Environment Verification ---")
-logging.info(f"Python version: {sys.version}")
-logging.info(f"img2pdf version: {img2pdf.__version__}")
-logging.info(f"Pillow version: {Image.__version__}")
-logging.info(f"Filesystem encoding: {sys.getfilesystemencoding()}")
-logging.info(f"Temporary directory: {tempfile.gettempdir()}")
-
 
 def generate_html_index(manga_title, chapters, output_dir):
     """Generate an HTML index file with sorted PDF links."""
@@ -511,7 +434,9 @@ def generate_html_index(manga_title, chapters, output_dir):
 """
 
     for chapter in chapters_sorted:
-        pdf_filename = f"chapter_{chapter['slot']}.pdf"
+        sanitized_manga_title = sanitize_filename(manga_title)
+        sanitized_chapter_title = sanitize_filename(chapter['title'])
+        pdf_filename = f"Chapter_{chapter['slot']}_{sanitized_manga_title}_{sanitized_chapter_title}.pdf"
         html_content += f"""
         <li class="chapter-item">
             <a href="{pdf_filename}" class="chapter-link">
@@ -534,8 +459,7 @@ def generate_html_index(manga_title, chapters, output_dir):
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html_content)
     logging.info(f"Generated index page: {html_path}")
-    
-    
+
 async def main():
     parser = argparse.ArgumentParser(description='Async Comic Chapter Scraper')
     parser.add_argument('book_id', help='Comic book identifier')
@@ -550,68 +474,71 @@ async def main():
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         try:
-            # Fetch comic information
-            title, raw_chapters = await get_content_info(session, args.book_id)
+            title, chapters = await get_content_info(session, args.book_id)
             output_dir = create_output_dir(title, args.book_id)
             
-            # Sort chapters numerically by slot
-            sorted_chapters = sorted(raw_chapters, key=lambda x: x['slot'])
-            
-            # Phase 1: Collect image URLs for all chapters
-            logging.info("Collecting image URLs for chapters...")
-            chapter_tasks = [process_chapter(session, args.book_id, ch['slot'], ch['title'])
-                           for ch in sorted_chapters]
-            all_images = await asyncio.gather(*chapter_tasks)
+            # Add file handler after output directory is created
+            log_file = os.path.join(output_dir, 'scraper.log')
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            file_handler.setLevel(logging.DEBUG if args.debug else logging.INFO)
+            logging.getLogger().addHandler(file_handler)
+            logging.info(f"Logging to file: {log_file}")
 
-            # Create processing queue with next chapter info
-            chapter_queue = []
-            for i, (chapter, images) in enumerate(zip(sorted_chapters, all_images)):
-                next_ch = sorted_chapters[i+1] if i < len(sorted_chapters)-1 else None
-                chapter_queue.append({
-                    'current': chapter,
-                    'images': images,
-                    'next': next_ch
-                })
+            log_path = os.path.join(output_dir, 'images.txt')
 
-            # Phase 2: Process chapters with navigation links
+            tasks = [process_chapter(session, args.book_id, ch['slot'], ch['title']) for ch in chapters]
+            all_images = await tqdm.asyncio.tqdm.gather(
+                *tasks, 
+                desc="📖 Fetching chapter URLs", 
+                colour="green"
+            )
+
+            with open(log_path, 'w', encoding='utf-8') as f:
+                for idx, (chapter, images) in enumerate(zip(chapters, all_images), 1):
+                    f.write(f"Chapter {idx}: {chapter['title']}\n")
+                    for img_url in images:
+                        f.write(f"{img_url}\n")
+                    f.write("\n")
+
             pdf_tasks = []
-            for item in chapter_queue:
-                chapter = item['current']
-                pdf_path = os.path.join(output_dir, f"chapter_{chapter['slot']}.pdf")
+            for chapter, image_urls in zip(chapters, all_images):
+                pdf_filename = f"chapter_{chapter['slot']}.pdf"
+                pdf_path = os.path.join(output_dir, pdf_filename)
                 
-                # Skip existing chapters unless forced
                 if os.path.exists(pdf_path) and not args.force:
                     logging.info(f"Skipping existing chapter: {chapter['title']}")
                     continue
-                    
-                if not item['images']:
+                
+                if not image_urls:
                     logging.warning(f"No images found for chapter {chapter['slot']}")
                     continue
 
-                task = download_and_create_pdf(
-                    session=session,
-                    output_dir=output_dir,
-                    chapter_slot=chapter['slot'],
-                    chapter_title=chapter['title'],
-                    image_urls=item['images'],
-                    keep_images=args.keep_images,
-                    next_chapter=item['next']
+                pdf_task = download_and_create_pdf(
+                    session,
+                    output_dir,
+                    title,
+                    chapter['slot'],
+                    chapter['title'],
+                    image_urls,
+                    args.keep_images
                 )
-                pdf_tasks.append(task)
+                pdf_tasks.append(pdf_task)
 
-            # Execute all PDF generation tasks
-            await asyncio.gather(*pdf_tasks)
+            await tqdm.asyncio.tqdm.gather(
+                *pdf_tasks, 
+                desc="📚 Creating PDFs", 
+                colour="blue",
+                disable=args.debug
+            )
 
-            # Generate final index with all chapter info
-            generate_html_index(title, sorted_chapters, output_dir)
-            logging.info(f"Processing complete. Open {output_dir}/index.html for navigation")
+            generate_html_index(title, chapters, output_dir)
+            logging.info(f"Processing complete. Open index.html in {output_dir} to access chapters")
 
         except Exception as e:
             logging.error(f"Fatal error: {e}")
-            if args.debug:
-                import traceback
-                traceback.print_exc()
-            sys.exit(1)
+            raise
+            
 
 if __name__ == '__main__':
     asyncio.run(main())

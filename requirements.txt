@@ -1,5 +1,5 @@
 brotli
-img2pdf
+img2pdf==0.4.4
 tqdm
 beautifulsoup4
 pillow

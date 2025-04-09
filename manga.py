@@ -17,6 +17,8 @@ from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 import tqdm.asyncio
 import unicodedata
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 
 # Initial console logging configuration
 logging.basicConfig(
@@ -468,72 +470,69 @@ async def main():
     parser.add_argument('--force', action='store_true', help='Force re-download of existing chapters')
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.info("Debug logging enabled")
+    # Configure root logger early
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
+
+    # Clear existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Add console handler (stderr)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    root_logger.addHandler(console_handler)
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         try:
             title, chapters = await get_content_info(session, args.book_id)
             output_dir = create_output_dir(title, args.book_id)
             
-            # Add file handler after output directory is created
+            # Configure file handler (after output dir exists)
             log_file = os.path.join(output_dir, 'scraper.log')
             file_handler = logging.FileHandler(log_file, encoding='utf-8')
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-            file_handler.setLevel(logging.DEBUG if args.debug else logging.INFO)
-            logging.getLogger().addHandler(file_handler)
+            root_logger.addHandler(file_handler)
             logging.info(f"Logging to file: {log_file}")
 
-            log_path = os.path.join(output_dir, 'images.txt')
-
-            tasks = [process_chapter(session, args.book_id, ch['slot'], ch['title']) for ch in chapters]
-            all_images = await tqdm.asyncio.tqdm.gather(
-                *tasks, 
-                desc="📖 Fetching chapter URLs", 
-                colour="green"
-            )
-
-            with open(log_path, 'w', encoding='utf-8') as f:
-                for idx, (chapter, images) in enumerate(zip(chapters, all_images), 1):
-                    f.write(f"Chapter {idx}: {chapter['title']}\n")
-                    for img_url in images:
-                        f.write(f"{img_url}\n")
-                    f.write("\n")
-
-            pdf_tasks = []
-            for chapter, image_urls in zip(chapters, all_images):
-                pdf_filename = f"chapter_{chapter['slot']}.pdf"
-                pdf_path = os.path.join(output_dir, pdf_filename)
-                
-                if os.path.exists(pdf_path) and not args.force:
-                    logging.info(f"Skipping existing chapter: {chapter['title']}")
-                    continue
-                
-                if not image_urls:
-                    logging.warning(f"No images found for chapter {chapter['slot']}")
-                    continue
-
-                pdf_task = download_and_create_pdf(
-                    session,
-                    output_dir,
-                    title,
-                    chapter['slot'],
-                    chapter['title'],
-                    image_urls,
-                    args.keep_images
+            # Main processing with tqdm integration
+            with logging_redirect_tqdm():
+                # Content URL fetching
+                tasks = [process_chapter(session, args.book_id, ch['slot'], ch['title']) for ch in chapters]
+                all_images = await tqdm.asyncio.tqdm.gather(
+                    *tasks,
+                    desc="📖 Fetching chapter URLs",
+                    colour="green",
+                    ascii=True  # Better for some terminals
                 )
-                pdf_tasks.append(pdf_task)
 
-            await tqdm.asyncio.tqdm.gather(
-                *pdf_tasks, 
-                desc="📚 Creating PDFs", 
-                colour="blue",
-                disable=args.debug
-            )
+                # PDF creation phase
+                pdf_tasks = []
+                for chapter, image_urls in zip(chapters, all_images):
+                    if not image_urls:
+                        continue
+                    pdf_tasks.append(
+                        download_and_create_pdf(
+                            session, output_dir, title,
+                            chapter['slot'], chapter['title'],
+                            image_urls, args.keep_images
+                        )
+                    )
 
+                # Use standard tqdm for non-async progress
+                with tqdm.tqdm(
+                    total=len(pdf_tasks),
+                    desc="📚 Creating PDFs",
+                    colour="blue",
+                    disable=args.debug or not pdf_tasks
+                ) as pbar:
+                    for coro in asyncio.as_completed(pdf_tasks):
+                        await coro
+                        pbar.update(1)
+
+            # Generate index after completion
             generate_html_index(title, chapters, output_dir)
-            logging.info(f"Processing complete. Open index.html in {output_dir} to access chapters")
+            logging.info(f"Processing complete. Open index.html in {output_dir}")
 
         except Exception as e:
             logging.error(f"Fatal error: {e}")
