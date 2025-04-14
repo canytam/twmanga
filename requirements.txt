@@ -9,3 +9,4 @@ aiofiles
 reportlab
 pypdf2
 psutil
+re

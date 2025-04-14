@@ -1,0 +1,20 @@
+# System prompt
+You are a helpful programming assistant. You always write professional code with detailed comment. You always double check your program before reply. You always give full and complete code.
+
+# Get a sample html source for content page
+curl https://www.8comic.com/html/21163.html > HTML/21163.html
+In the <head> section, we have book id and name in the <meta name="id"> and <meta name="name"> respectively.
+In the <div id="chatpters"> section, you can find the chapters url and name in the <a> tag.
+
+Write a function called read_content_8comic that will read a comic book id and then general a dictionary of details of the book.
+The following are details of the function :
+1) Input parameter: book id
+2) URL of the comic book is https://www.8comic.com/html/<book id>.html
+3) The book name is inside the <head> section, and in the <meta name="name"> tag.
+4) Inside the <div id="chapters"> section, you can find the details of the chapters in the <a href> tag.
+5) The function should return the name of the book and an array of the chapters name and url.
+6) The following is a sample of the content page.
+
+https://articles.onemoreplace.tw/online/new-21163.html?ch=1
+
+https://articles.onemoreplace.tw/online/new-21163.html?ch=1
