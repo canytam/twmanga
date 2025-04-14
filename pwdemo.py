@@ -5,7 +5,7 @@ from urllib.parse import unquote
 
 with sync_playwright() as p:
     book_id = 21163
-    browser = p.firefox.launch(headless=True, slow_mo=200)
+    browser = p.firefox.launch(headless=False, slow_mo=300)
     page = browser.new_page()
     page.goto(f"https://www.8comic.com/html/{book_id}.html")
     header = page.inner_html('head')
@@ -21,7 +21,10 @@ with sync_playwright() as p:
             chapters.append(a_tag['id'])
     
     os.makedirs(book_dir, exist_ok=True)
-    os.makedirs(f'{book_dir}/images', exist_ok=True)
+    os.makedirs(f'{book_dir}/{book_dir}-images', exist_ok=True)
+    page.click(f'a#{chapters[0]}')
+    page.is_visible('div.comics-end')
+    page.click('a.view-back')
     for chapter in chapters:
         page.click(f'a#{chapter}')
         page.is_visible('div.comics-end')
@@ -35,7 +38,7 @@ with sync_playwright() as p:
             elif img_tag.has_attr('s'):
                 images.append('https:'+unquote(img_tag['s']))
         print(images)
-        with open(f'{book_dir}/images/images-{chapter}.txt', 'w') as file:
+        with open(f'{book_dir}/{book_dir}-images/images-{chapter}.txt', 'w') as file:
             for item in images:
                 file.write(f"{item}\n")
         page.click('a.view-back')
